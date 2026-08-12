@@ -37,6 +37,10 @@ THEODB_USER = os.environ.get("THEODB_USER", "postgres")
 THEODB_PASSWORD = os.environ.get("THEODB_PASSWORD", "theo")
 THEODB_DBNAME = os.environ.get("THEODB_DBNAME", "theo")
 
+# A plain PostgreSQL with pgvector installed, used as the negative control: it answers,
+# it has the `vector` type and an `hnsw` access method, and it is NOT TheoDB.
+IMPOSTOR_PORT = int(os.environ.get("IMPOSTOR_PORT", "55436"))
+
 DIM = 64
 N_ROWS = 5000
 K = 10
@@ -298,3 +302,70 @@ def test_client_is_deepcopyable_when_idle(corpus):
     client = _live_client(drop_old=False)
     clone = copy.deepcopy(client)
     assert clone.table_name == client.table_name
+
+
+# --------------------------------------------------------------------------------------
+# Identity — the client must not measure a database that is not TheoDB
+# --------------------------------------------------------------------------------------
+
+
+def _impostor_reachable() -> bool:
+    try:
+        import psycopg
+
+        with psycopg.connect(
+            host=THEODB_HOST,
+            port=IMPOSTOR_PORT,
+            user=THEODB_USER,
+            password=THEODB_PASSWORD,
+            dbname=THEODB_DBNAME,
+            connect_timeout=3,
+        ) as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(not _impostor_reachable(), reason=f"no impostor DB at :{IMPOSTOR_PORT}")
+def test_client_refuses_a_database_that_is_not_theodb():
+    """pgvector answers every probe the client would otherwise make.
+
+    It has the `vector` type, an `hnsw` access method and `vector_l2_ops`. Without an
+    identity check the run completes and its numbers are published under the TheoDB
+    label — a mislabelled measurement, which is worse than a failed one.
+    """
+    from pydantic import SecretStr
+
+    from vectordb_bench.backend.clients.theodb.config import (
+        NotATheoDBError,
+        TheoDBConfig,
+        TheoDBHNSWConfig,
+    )
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+
+    config = TheoDBConfig(
+        user_name=SecretStr(THEODB_USER),
+        password=SecretStr(THEODB_PASSWORD),
+        host=THEODB_HOST,
+        port=IMPOSTOR_PORT,
+        db_name=THEODB_DBNAME,
+    )
+    with pytest.raises(NotATheoDBError) as exc:
+        TheoDB(
+            dim=DIM,
+            db_config=config.to_dict(),
+            db_case_config=TheoDBHNSWConfig(metric_type=MetricType.L2),
+            collection_name="vdbb_theodb_identity",
+            drop_old=True,
+        )
+
+    message = str(exc.value)
+    assert "theodb_hnsw" in message
+    assert str(IMPOSTOR_PORT) in message
+
+
+@needs_theodb
+def test_client_accepts_a_real_theodb():
+    client = _live_client(drop_old=False)
+    assert client.table_name == "vdbb_theodb_live"

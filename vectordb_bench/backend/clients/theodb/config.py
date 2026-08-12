@@ -53,6 +53,29 @@ class UnsupportedBuildParameterError(ValueError):
         self.honoured = honoured
 
 
+class NotATheoDBError(RuntimeError):
+    """Raised when the configured endpoint answers but is not TheoDB.
+
+    pgvector satisfies every other probe this client makes: it has the `vector` type, an
+    `hnsw` access method and `vector_l2_ops`. Without this check a misdirected run
+    completes and publishes another engine's numbers under the TheoDB label — a
+    mislabelled measurement, which is worse than a failed one.
+    """
+
+    def __init__(self, host: str, port: int, dbname: str) -> None:
+        super().__init__(
+            f"{host}:{port}/{dbname} answered, but it is not TheoDB: the access method "
+            f"'{THEODB_NATIVE_ACCESS_METHOD}' is absent from pg_am. A plain PostgreSQL "
+            f"with pgvector looks identical to every other probe this client makes, so "
+            f"the run is refused rather than published under the wrong engine name."
+        )
+
+
+# The own-code access method. The `hnsw` alias exists in pgvector too, so it cannot tell
+# the two apart; this name only exists in TheoDB.
+THEODB_NATIVE_ACCESS_METHOD = "theodb_hnsw"
+
+
 class MetricSurface(NamedTuple):
     """The two catalogue names a metric maps to: index opclass and distance operator."""
 

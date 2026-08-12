@@ -25,6 +25,7 @@ from psycopg import Connection, Cursor, sql
 from vectordb_bench.backend.filter import Filter, FilterOp
 
 from ..api import VectorDB
+from .config import THEODB_NATIVE_ACCESS_METHOD, NotATheoDBError
 
 if TYPE_CHECKING:  # imports used only in annotations (PEP 563 via __future__)
     from collections.abc import Generator
@@ -79,6 +80,7 @@ class TheoDB(VectorDB):
         self.conn, self.cursor = self._create_connection(**self.connect_config)
         self.cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
         self.conn.commit()
+        self._assert_is_theodb()
 
         if drop_old:
             self._drop_index()
@@ -100,6 +102,24 @@ class TheoDB(VectorDB):
         register_vector(conn)
         conn.autocommit = False
         return conn, conn.cursor()
+
+    def _assert_is_theodb(self) -> None:
+        """Refuse an endpoint that answers but is not TheoDB.
+
+        Checked once, at construction, before the dataset is loaded — the cheapest point
+        at which a misdirected run can still be stopped.
+        """
+        found = self.cursor.execute(
+            "SELECT 1 FROM pg_am WHERE amname = %s",
+            (THEODB_NATIVE_ACCESS_METHOD,),
+        ).fetchone()
+        if found is None:
+            self._close_connection()
+            raise NotATheoDBError(
+                host=self.connect_config["host"],
+                port=self.connect_config["port"],
+                dbname=self.connect_config["dbname"],
+            )
 
     def _close_connection(self) -> None:
         if self.cursor is not None:
