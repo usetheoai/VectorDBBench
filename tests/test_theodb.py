@@ -369,3 +369,53 @@ def test_client_refuses_a_database_that_is_not_theodb():
 def test_client_accepts_a_real_theodb():
     client = _live_client(drop_old=False)
     assert client.table_name == "vdbb_theodb_live"
+
+
+@needs_theodb
+def test_client_works_against_a_database_without_the_extension():
+    """The client must create the extension before registering the vector adapters.
+
+    `register_vector` looks the type up in the catalogue and raises when it is absent, so
+    calling it before `CREATE EXTENSION` is a chicken-and-egg failure. It stays invisible
+    on the shipped TheoDB image, which installs the extension into template1 so every new
+    database inherits it — and it is exactly what broke the upstream pgvector client on a
+    clean machine (`pgvector.py:93` registers before `pgvector.py:61` creates).
+    """
+    import psycopg
+    from pydantic import SecretStr
+
+    from vectordb_bench.backend.clients.theodb.config import TheoDBConfig, TheoDBHNSWConfig
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+
+    admin = psycopg.connect(
+        host=THEODB_HOST, port=THEODB_PORT, user=THEODB_USER,
+        password=THEODB_PASSWORD, dbname=THEODB_DBNAME, autocommit=True,
+    )
+    admin.execute("DROP DATABASE IF EXISTS vdbb_no_ext")
+    admin.execute("CREATE DATABASE vdbb_no_ext")
+    try:
+        bare = psycopg.connect(
+            host=THEODB_HOST, port=THEODB_PORT, user=THEODB_USER,
+            password=THEODB_PASSWORD, dbname="vdbb_no_ext", autocommit=True,
+        )
+        bare.execute("DROP EXTENSION IF EXISTS vector CASCADE")
+        # theodb_rs owns the `vector` TYPE; dropping only the shim leaves the type
+        # behind and the scenario under test never materialises. Measured.
+        bare.execute("DROP EXTENSION IF EXISTS theodb CASCADE")
+        bare.execute("DROP EXTENSION IF EXISTS theodb_rs CASCADE")
+        assert bare.execute("SELECT count(*) FROM pg_type WHERE typname='vector'").fetchone()[0] == 0
+        bare.close()
+
+        config = TheoDBConfig(
+            user_name=SecretStr(THEODB_USER), password=SecretStr(THEODB_PASSWORD),
+            host=THEODB_HOST, port=THEODB_PORT, db_name="vdbb_no_ext",
+        )
+        client = TheoDB(
+            dim=DIM, db_config=config.to_dict(),
+            db_case_config=TheoDBHNSWConfig(metric_type=MetricType.L2),
+            collection_name="vdbb_no_ext_t", drop_old=True,
+        )
+        assert client.table_name == "vdbb_no_ext_t"
+    finally:
+        admin.execute("DROP DATABASE IF EXISTS vdbb_no_ext WITH (FORCE)")
+        admin.close()

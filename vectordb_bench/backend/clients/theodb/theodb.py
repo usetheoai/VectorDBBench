@@ -78,8 +78,6 @@ class TheoDB(VectorDB):
             raise RuntimeError(msg)
 
         self.conn, self.cursor = self._create_connection(**self.connect_config)
-        self.cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        self.conn.commit()
         self._assert_is_theodb()
 
         if drop_old:
@@ -98,6 +96,18 @@ class TheoDB(VectorDB):
     @staticmethod
     def _create_connection(**kwargs) -> tuple[Connection, Cursor]:
         conn = psycopg.connect(**kwargs)
+        # The extension comes first: register_vector looks the `vector` type up in the
+        # catalogue and raises when it is absent, so registering before creating is a
+        # chicken-and-egg failure — the one that breaks the upstream pgvector client on a
+        # clean database (`pgvector.py:93` registers, `pgvector.py:61` creates). CASCADE
+        # because TheoDB's `vector` shim requires `theodb_rs`.
+        #
+        # On the shipped TheoDB image both extensions live in template1, so every new
+        # database inherits them and this ordering never bites. It matters anyway: on a
+        # database without them, getting past this line is what lets the identity check
+        # below report "this is not TheoDB" instead of an opaque "vector type not found".
+        conn.execute("CREATE EXTENSION IF NOT EXISTS vector CASCADE")
+        conn.commit()
         # BEFORE the cursor — see the module docstring.
         register_vector(conn)
         conn.autocommit = False
