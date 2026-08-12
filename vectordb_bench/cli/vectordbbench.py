@@ -45,6 +45,7 @@ from ..backend.clients.s3_vectors.cli import S3Vectors
 from ..backend.clients.seekdb.cli import SeekDBHNSW
 from ..backend.clients.tencent_elasticsearch.cli import TencentElasticsearch
 from ..backend.clients.test.cli import Test
+from ..backend.clients.theodb.cli import TheoDBHNSW
 from ..backend.clients.tidb.cli import TiDB
 from ..backend.clients.turbopuffer.cli import TurboPuffer, TurboPufferUnpin
 from ..backend.clients.vectorchord.cli import VectorChordGraph, VectorChordRQ
@@ -70,6 +71,7 @@ cli.add_command(MilvusFTS)
 cli.add_command(AWSOpenSearch)
 cli.add_command(OSSOpenSearch)
 cli.add_command(PgVectorScaleDiskAnn)
+cli.add_command(TheoDBHNSW)
 cli.add_command(PgDiskAnn)
 cli.add_command(AlloyDBScaNN)
 cli.add_command(OceanBaseHNSW)

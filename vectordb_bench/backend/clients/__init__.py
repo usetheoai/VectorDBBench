@@ -32,6 +32,7 @@ class DB(Enum):
     PgVector = "PgVector"
     PgVectoRS = "PgVectoRS"
     PgVectorScale = "PgVectorScale"
+    TheoDB = "TheoDB"
     PgDiskANN = "PgDiskANN"
     AlloyDB = "AlloyDB"
     Redis = "Redis"
@@ -118,6 +119,11 @@ class DB(Enum):
             from .pgvectorscale.pgvectorscale import PgVectorScale
 
             return PgVectorScale
+
+        if self == DB.TheoDB:
+            from .theodb.theodb import TheoDB
+
+            return TheoDB
 
         if self == DB.PgDiskANN:
             from .pgdiskann.pgdiskann import PgDiskANN
@@ -336,6 +342,11 @@ class DB(Enum):
             from .pgvectorscale.config import PgVectorScaleConfig
 
             return PgVectorScaleConfig
+
+        if self == DB.TheoDB:
+            from .theodb.config import TheoDBConfig
+
+            return TheoDBConfig
 
         if self == DB.PgDiskANN:
             from .pgdiskann.config import PgDiskANNConfig
@@ -577,6 +588,11 @@ class DB(Enum):
             from .pgvectorscale.config import _pgvectorscale_case_config
 
             return _pgvectorscale_case_config.get(index_type)
+
+        if self == DB.TheoDB:
+            from .theodb.config import _theodb_case_config
+
+            return _theodb_case_config.get(index_type)
 
         if self == DB.PgDiskANN:
             from .pgdiskann.config import _pgdiskann_case_config
