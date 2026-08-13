@@ -13,6 +13,7 @@ a misleading "cannot adapt type 'ndarray'".
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
@@ -23,8 +24,9 @@ from pgvector.psycopg import register_vector
 from psycopg import Connection, Cursor, sql
 
 from vectordb_bench.backend.filter import Filter, FilterOp
+from vectordb_bench.backend.payload import PayloadProfile
 
-from ..api import VectorDB
+from ..api import IndexType, VectorDB
 from .config import THEODB_NATIVE_ACCESS_METHOD, NotATheoDBError
 
 if TYPE_CHECKING:  # imports used only in annotations (PEP 563 via __future__)
@@ -33,6 +35,18 @@ if TYPE_CHECKING:  # imports used only in annotations (PEP 563 via __future__)
     from .config import TheoDBConfigDict, TheoDBIndexConfig
 
 log = logging.getLogger(__name__)
+
+
+def _lexical_index_id_for(collection_name: str) -> int:
+    """Stable, collision-resistant lexical index id derived from the collection name.
+
+    bm25_build takes a bigint id rather than a name. Hashing the collection keeps a run
+    repeatable (a re-run rebuilds the same id instead of leaking a new index every time)
+    and keeps two collections in one database apart. blake2b rather than hash() because
+    Python randomises string hashing per process, and the runner spawns several.
+    """
+    digest = hashlib.blake2b(collection_name.encode("utf-8"), digest_size=6).digest()
+    return int.from_bytes(digest, "big")
 
 
 class TheoDB(VectorDB):
@@ -69,8 +83,26 @@ class TheoDB(VectorDB):
         self._index_name = f"{collection_name}_theodb_idx"
         self._primary_field = "id"
         self._vector_field = "embedding"
+        self._text_field = "body"
+        # bm25_build needs a BIGINT key; the harness gives opaque string ids. The
+        # surrogate carries the first, the doc_id column carries the second, and
+        # search_documents joins back so the engine's ranking is what comes out.
+        self._rowid_field = "rowid"
+        self._doc_id_field = "doc_id"
 
-        if not (self.case_config.create_index_before_load or self.case_config.create_index_after_load):
+        # The full-text case has no vector column and no ANN index; it is driven by
+        # bm25_build/bm25_search instead. Deciding once here keeps every branch below
+        # explicit rather than inferring the mode from whichever field happens to be set.
+        self._is_fts = getattr(self.case_config, "index", None) == IndexType.FTS
+        # A stable id makes a run repeatable: re-running rebuilds the same index rather
+        # than accumulating one per run. Derived from the collection so two collections
+        # in one database do not collide.
+        self._lexical_index_id = _lexical_index_id_for(collection_name)
+        self._lexical_index_built = False
+
+        if not self._is_fts and not (
+            self.case_config.create_index_before_load or self.case_config.create_index_after_load
+        ):
             msg = (
                 f"{self.name} needs create_index_before_load or create_index_after_load; "
                 f"a run with no index measures a sequential scan, not the engine."
@@ -81,11 +113,15 @@ class TheoDB(VectorDB):
         self._assert_is_theodb()
 
         if drop_old:
-            self._drop_index()
-            self._drop_table()
-            self._create_table()
-            if self.case_config.create_index_before_load:
-                self._create_index()
+            if self._is_fts:
+                self._drop_table()
+                self._create_document_table()
+            else:
+                self._drop_index()
+                self._drop_table()
+                self._create_table()
+                if self.case_config.create_index_before_load:
+                    self._create_index()
 
         # Release before the runner deep-copies this instance across processes: a live
         # psycopg connection is not picklable (upstream issue #756).
@@ -169,6 +205,126 @@ class TheoDB(VectorDB):
         )
         self.conn.commit()
 
+    # ------------------------------------------------------------------ full text
+
+    @classmethod
+    def supports_full_text_search(cls) -> bool:
+        return True
+
+    def has_text_field(self) -> bool:
+        return self._is_fts
+
+    def _create_document_table(self) -> None:
+        """Table for the full-text case: a surrogate bigint key beside the real id.
+
+        `bm25_build` requires the id column to be BIGINT — measured: a TEXT id fails with
+        `invalid input syntax for type bigint`. The harness's document ids are opaque
+        strings (MS MARCO passage ids are numeric, HotpotQA's are not), so coercing them
+        would work for one dataset and corrupt the next.
+
+        The surrogate is `GENERATED ALWAYS AS IDENTITY` rather than a client-side counter
+        because the concurrent insert runner deep-copies this client across processes and
+        two counters would collide. Assigning keys is the database's job.
+        """
+        self.cursor.execute(
+            sql.SQL(
+                "CREATE TABLE IF NOT EXISTS public.{table} ("
+                "{rowid} BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "
+                "{doc_id} TEXT NOT NULL, "
+                "{body} TEXT NOT NULL)",
+            ).format(
+                table=sql.Identifier(self.table_name),
+                rowid=sql.Identifier(self._rowid_field),
+                doc_id=sql.Identifier(self._doc_id_field),
+                body=sql.Identifier(self._text_field),
+            ),
+        )
+        self.conn.commit()
+
+    def insert_documents(
+        self,
+        texts: list[str],
+        doc_ids: list[str],
+        **kwargs: Any,
+    ) -> tuple[int, Exception | None]:
+        """Load only. The lexical index is built in optimize() — see the class docstring."""
+        try:
+            with self.cursor.copy(
+                sql.SQL("COPY public.{table} ({doc_id}, {body}) FROM STDIN (FORMAT BINARY)").format(
+                    table=sql.Identifier(self.table_name),
+                    doc_id=sql.Identifier(self._doc_id_field),
+                    body=sql.Identifier(self._text_field),
+                ),
+            ) as copy:
+                copy.set_types(["text", "text"])
+                for doc_id, text in zip(doc_ids, texts, strict=True):
+                    copy.write_row((doc_id, text))
+            self.conn.commit()
+        except Exception as exc:
+            log.warning(f"{self.name} failed to insert documents into {self.table_name}: {exc}")
+            return 0, exc
+        return len(doc_ids), None
+
+    def _build_lexical_index(self) -> int:
+        """Full rebuild over the loaded table. Returns the indexed document count."""
+        indexed = self.cursor.execute(
+            "SELECT bm25_build(%s, %s, %s, %s)",
+            (self._lexical_index_id, self.table_name, self._rowid_field, self._text_field),
+        ).fetchone()[0]
+        self.conn.commit()
+        self._lexical_index_built = True
+        log.info(f"{self.name} built lexical index {self._lexical_index_id}: {indexed} documents")
+        return int(indexed)
+
+    def search_documents(
+        self,
+        query: str,
+        k: int = 100,
+        payload_profile: PayloadProfile = PayloadProfile.IDS_ONLY,
+        **kwargs: Any,
+    ) -> list[str]:
+        """Ranked document ids, best first.
+
+        `bm25_search` returns (id, score) ordered by score descending, so the order is
+        the engine's — this method never re-sorts. NDCG and MRR are computed from this
+        order, so re-ranking here would measure the client rather than the engine.
+        """
+        self._assert_lexical_index_built()
+        rows = self.cursor.execute(
+            sql.SQL(
+                "SELECT t.{doc_id} FROM bm25_search(%s, %s, %s) AS s "
+                "JOIN public.{table} AS t ON t.{rowid} = s.id "
+                "ORDER BY s.score DESC",
+            ).format(
+                doc_id=sql.Identifier(self._doc_id_field),
+                table=sql.Identifier(self.table_name),
+                rowid=sql.Identifier(self._rowid_field),
+            ),
+            (self._lexical_index_id, query, k),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _assert_lexical_index_built(self) -> None:
+        """Refuse to search an index that was never built.
+
+        Measured: `bm25_search` over an unbuilt index_id returns zero rows and no error,
+        which is indistinguishable from "nothing matched". A whole run would then report
+        recall 0 as if it were a measurement. The catalogue answers the question as fact
+        rather than trusting a client-side flag that a deep-copied process may not carry.
+        """
+        built = self.cursor.execute(
+            "SELECT 1 FROM theodb.lexical_index_meta WHERE index_id = %s",
+            (self._lexical_index_id,),
+        ).fetchone()
+        if built is None:
+            msg = (
+                f"lexical index {self._lexical_index_id} for collection "
+                f"'{self.table_name}' was never built: bm25_search would return an empty "
+                f"result that is indistinguishable from 'nothing matched'. Call optimize() "
+                f"after loading the documents."
+            )
+            raise RuntimeError(msg)
+
     def _create_table(self) -> None:
         self.cursor.execute(
             sql.SQL(
@@ -225,6 +381,11 @@ class TheoDB(VectorDB):
         self.conn.commit()
 
     def optimize(self, data_size: int | None = None) -> None:
+        if self._is_fts:
+            # Full rebuild, once, after the load. Building per batch would be quadratic
+            # and would make the harness's build-time metric meaningless.
+            self._build_lexical_index()
+            return
         # Exactly what the pgvector client does — drop and rebuild. No VACUUM, no
         # ANALYZE: a maintenance step applied to one side only would tilt the comparison
         # while the published table said nothing about it.

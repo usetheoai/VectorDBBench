@@ -33,6 +33,10 @@ THEODB_HNSW_EF_CONSTRUCTION = 64
 # Tracking item for making these real reloptions.
 _BUILD_PARAM_ISSUE = "B-036"
 
+# Tracking item for exposing BM25's k1/b. TheoDB has no GUC for either — measured against
+# pg_settings, which has no bm25/lexical/k1 entry at all.
+_BM25_PARAM_ISSUE = "B-040"
+
 
 class UnsupportedBuildParameterError(ValueError):
     """Raised when a case asks for a build parameter TheoDB cannot honour.
@@ -41,16 +45,22 @@ class UnsupportedBuildParameterError(ValueError):
     that reports a parameter it did not apply.
     """
 
-    def __init__(self, name: str, requested: object, honoured: object) -> None:
+    def __init__(
+        self,
+        name: str,
+        requested: object,
+        reason: str,
+        remedy: str,
+        issue: str,
+    ) -> None:
         super().__init__(
-            f"TheoDB cannot honour {name}={requested}: the build is fixed at "
-            f"{name}={honoured} (theodb_rs/src/am/build.rs:22-23), so running with "
+            f"TheoDB cannot honour {name}={requested}: {reason}, so running with "
             f"{name}={requested} would report a parameter that was never applied. "
-            f"Use {name}={honoured} or omit it. Tracking item: {_BUILD_PARAM_ISSUE}."
+            f"{remedy} Tracking item: {issue}."
         )
         self.name = name
         self.requested = requested
-        self.honoured = honoured
+        self.issue = issue
 
 
 class NotATheoDBError(RuntimeError):
@@ -193,7 +203,13 @@ class TheoDBHNSWConfig(TheoDBIndexConfig):
         for name, honoured in cls._honoured_build_params.items():
             requested = values.get(name)
             if requested is not None and requested != honoured:
-                raise UnsupportedBuildParameterError(name, requested, honoured)
+                raise UnsupportedBuildParameterError(
+                    name,
+                    requested,
+                    reason=(f"the build is fixed at {name}={honoured} (theodb_rs/src/am/build.rs:22-23)"),
+                    remedy=f"Use {name}={honoured} or omit it.",
+                    issue=_BUILD_PARAM_ISSUE,
+                )
 
     @model_validator(mode="before")
     @classmethod
@@ -233,3 +249,63 @@ class TheoDBHNSWConfig(TheoDBIndexConfig):
 _theodb_case_config = {
     IndexType.HNSW: TheoDBHNSWConfig,
 }
+
+
+class TheoDBFTSConfig(TheoDBIndexConfig):
+    """Full-text (BM25) case config.
+
+    TheoDB's BM25 has no tunable knobs: `k1` and `b` are not exposed as GUCs (measured —
+    `pg_settings` has no bm25/lexical entry), so a run is product-default and nothing
+    else. Accepting either value and running anyway would publish a comparison that
+    claims a parameterisation which never happened; the harness explicitly warns that
+    engines differ here.
+    """
+
+    index: IndexType = IndexType.FTS
+    metric_type: MetricType | None = MetricType.BM25
+    k1: float | None = None
+    b: float | None = None
+
+    _unhonourable_params: ClassVar[tuple[str, ...]] = ("k1", "b")
+
+    def __init__(self, **data: object) -> None:
+        self._refuse_unhonourable_bm25_params(data)
+        super().__init__(**data)
+
+    @classmethod
+    def _refuse_unhonourable_bm25_params(cls, values: object) -> None:
+        if not isinstance(values, dict):
+            return
+        for name in cls._unhonourable_params:
+            if values.get(name) is not None:
+                raise UnsupportedBuildParameterError(
+                    name,
+                    values[name],
+                    reason=(f"TheoDB's BM25 exposes no GUC for {name}, so the ranking function cannot be tuned at all"),
+                    remedy=f"Omit {name}; the run is product-default and must be reported as such.",
+                    issue=_BM25_PARAM_ISSUE,
+                )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_on_every_bm25_construction_path(cls, values: object) -> object:
+        cls._refuse_unhonourable_bm25_params(values)
+        return values
+
+    def _metric_surface(self) -> MetricSurface:
+        # BM25 is not a vector distance: there is no opclass and no operator. The base
+        # class's mapping deliberately does not cover it.
+        msg = "TheoDBFTSConfig has no vector metric surface; full-text search uses bm25_search"
+        raise ValueError(msg)
+
+    def index_param(self) -> dict:
+        return {"metric": "bm25", "index_type": "bm25", "options": {}}
+
+    def search_param(self) -> dict:
+        return {"metric": "bm25"}
+
+    def session_param(self) -> dict:
+        return {}
+
+
+_theodb_case_config[IndexType.FTS] = TheoDBFTSConfig
