@@ -27,7 +27,11 @@ from vectordb_bench.backend.filter import Filter, FilterOp
 from vectordb_bench.backend.payload import PayloadProfile
 
 from ..api import IndexType, VectorDB
-from .config import THEODB_NATIVE_ACCESS_METHOD, NotATheoDBError
+from .config import (
+    THEODB_NATIVE_ACCESS_METHOD,
+    NotATheoDBError,
+    UnsupportedBuildParameterError,
+)
 
 if TYPE_CHECKING:  # imports used only in annotations (PEP 563 via __future__)
     from collections.abc import Generator
@@ -47,6 +51,20 @@ def _lexical_index_id_for(collection_name: str) -> int:
     """
     digest = hashlib.blake2b(collection_name.encode("utf-8"), digest_size=6).digest()
     return int.from_bytes(digest, "big")
+
+
+# Nome fixo da tabela temporária da sonda. Fixo de propósito: um nome aleatório tornaria
+# o SQL emitido não-asserível, e a tabela é TEMP + dentro de um savepoint revertido.
+_PROBE_TABLE = "_theodb_build_param_probe"
+
+
+def _rollback_probe(cursor) -> None:
+    """Desfaz a sonda. Best-effort: se o próprio rollback falhar, o erro que importa é o
+    da sonda, e mascará-lo com o do rollback trocaria o diagnóstico pelo sintoma."""
+    try:
+        cursor.execute("ROLLBACK TO SAVEPOINT theodb_build_param_probe")
+    except Exception:  # noqa: BLE001, S110
+        pass
 
 
 class TheoDB(VectorDB):
@@ -111,6 +129,10 @@ class TheoDB(VectorDB):
 
         self.conn, self.cursor = self._create_connection(**self.connect_config)
         self._assert_is_theodb()
+        # Antes da carga, que é a única hora em que uma corrida mal-direcionada ainda é
+        # barata de parar. Depois dela, descobrir que o parâmetro não é honrado custa o
+        # dataset inteiro — foi a lição que o B-035 pagou.
+        self.probe_build_params(self.cursor, self.case_config)
 
         if drop_old:
             if self._is_fts:
@@ -347,6 +369,18 @@ class TheoDB(VectorDB):
         self.conn.commit()
 
     @staticmethod
+    def _render_with_clause(options: dict) -> str:
+        """`WITH (k = v, ...)`, or the empty string when nothing was asked.
+
+        The empty case is not cosmetic: `WITH ()` is a syntax error, so a client that
+        always emitted the clause would break every default run.
+        """
+        if not options:
+            return ""
+        rendered = ", ".join(f"{name} = {int(value)}" for name, value in options.items())
+        return f" WITH ({rendered})"
+
+    @staticmethod
     def render_create_index(
         table_name: str,
         index_name: str,
@@ -355,19 +389,73 @@ class TheoDB(VectorDB):
     ) -> str:
         """Render the CREATE INDEX statement.
 
-        Pure and static so the emitted SQL can be asserted without a database. There is
-        deliberately no WITH clause: TheoDB's `hnsw` access method rejects `m` and
-        `ef_construction` as reloptions, and the config layer has already refused any
-        value that would need one.
+        Pure and static so the emitted SQL can be asserted without a database. Since
+        B-036 the `WITH` clause carries whatever build knobs the case asked for; whether
+        the server honours them was already settled by `probe_build_params`, before the
+        load — so reaching this point with an unsupported knob is impossible by
+        construction, not by hope.
         """
         index_param = case_config.index_param()
-        if index_param["options"]:
-            msg = f"TheoDB emits no index options, got {index_param['options']}"
-            raise AssertionError(msg)
         return (
             f'CREATE INDEX IF NOT EXISTS "{index_name}" ON public."{table_name}" '
             f'USING {index_param["index_type"]} ("{vector_field}" {index_param["metric"]})'
+            f"{TheoDB._render_with_clause(index_param['options'])}"
         )
+
+    @staticmethod
+    def render_build_param_probe(case_config: TheoDBIndexConfig) -> str:
+        """The `CREATE INDEX` the probe will try, asking for EXACTLY what was requested.
+
+        Emitting a fixed pair here would pass against any server and then let an
+        unsupported value through — the original defect with one more layer of
+        indirection. The probe's whole worth is that it tests the real request.
+        """
+        options = case_config.index_param()["options"]
+        return (
+            f"CREATE INDEX ON {_PROBE_TABLE} "
+            f'USING hnsw (e {case_config.index_param()["metric"]})'
+            f"{TheoDB._render_with_clause(options)}"
+        )
+
+    @staticmethod
+    def probe_build_params(cursor, case_config: TheoDBIndexConfig, probe_sql: str | None = None) -> None:
+        """Ask the SERVER whether it honours the requested build knobs. Raises if not.
+
+        Runs before the dataset is loaded, inside a savepoint that is always rolled back:
+        a probe that left a table behind would make the next run inherit state, and a run
+        that inherits state is not reproducible.
+
+        Why a probe and not a version check: a version string describes the build the
+        client was compiled against, and comparing it measures the LABEL rather than the
+        CAPABILITY. That distinction is not theoretical here — the b047 lexical run
+        published a 6.4% advantage that was entirely an artefact of trusting a label.
+        """
+        requested = case_config.index_param()["options"]
+        if not requested:
+            return
+        sql = probe_sql or TheoDB.render_build_param_probe(case_config)
+        try:
+            cursor.execute("SAVEPOINT theodb_build_param_probe")
+            cursor.execute(f"CREATE TEMP TABLE {_PROBE_TABLE} (e vector(2))")
+            cursor.execute(sql)
+        except Exception as exc:  # noqa: BLE001 — re-raised as a typed error below
+            message = str(exc)
+            _rollback_probe(cursor)
+            name = next(
+                (n for n in requested if f'"{n}"' in message),
+                ", ".join(requested),
+            )
+            raise UnsupportedBuildParameterError(
+                name,
+                requested.get(name, requested),
+                reason=f"the server refused it: {message.strip()}",
+                remedy=(
+                    "Point the run at a TheoDB that registers this reloption "
+                    "(B-036 shipped it), or omit the parameter."
+                ),
+                issue="B-046",
+            ) from exc
+        _rollback_probe(cursor)
 
     def _create_index(self) -> None:
         statement = self.render_create_index(

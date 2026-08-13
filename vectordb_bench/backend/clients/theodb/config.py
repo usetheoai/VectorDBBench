@@ -2,14 +2,21 @@
 
 TheoDB ships a `vector` type that is wire-compatible with pgvector and its own
 `theodb_hnsw` access method, registered under the alias `hnsw` so pgvector DDL works
-unchanged. What it does NOT have are the pgvector *build* knobs: `m` and
-`ef_construction` are compile-time constants, not index reloptions.
+unchanged. Since B-036 (`cecd388`) it also honours the pgvector *build* knobs: `m` and
+`ef_construction` are real reloptions, validated by the server and recorded in
+`pg_class.reloptions`.
 
-That gap is the reason this module exists in the shape it does. A case config that
-silently dropped an unsupported knob would let a run complete and report
-`ef_construction=200` over an index built with 64 — a wrong measurement that looks
-right, which is worse than no measurement at all. So the knobs are validated at config
-construction, before any connection is opened.
+The shape of this module is still driven by the same fear, and the fear is still right:
+a case config that silently dropped an unsupported knob would let a run complete and
+report `ef_construction=200` over an index built with 64 — a wrong measurement that
+looks right, which is worse than no measurement at all.
+
+What changed is WHO decides. Until B-046 the answer came from a constant mirrored from
+`build.rs`; a constant describes the engine the client was written against, not the one
+it is pointed at, so it measures the LABEL instead of the CAPABILITY — the failure the
+b047 lexical run documented. The decision now comes from a probe against the live server
+(`TheoDB.probe_build_params`), still before the dataset is loaded, which is the only
+point where a misdirected run is still cheap to stop.
 """
 
 from __future__ import annotations
@@ -21,16 +28,20 @@ from pydantic import BaseModel, SecretStr, model_validator
 
 from ..api import DBCaseConfig, DBConfig, IndexType, MetricType
 
-# Build parameters TheoDB honours, read from its source rather than assumed:
-# `theodb_rs/src/am/build.rs:22-23` — `HNSW_M` and `HNSW_EF_CONSTRUCTION` are consts.
-# `ef_construction` is overridable only through the server-side environment variable
-# `THEODB_HNSW_EF_CONSTRUCTION` (`build.rs:30-36`), which a client cannot reach per
-# session. They coincide with pgvector's own defaults, so the default comparison between
-# the two engines is like-for-like without any adjustment.
-THEODB_HNSW_M = 16
-THEODB_HNSW_EF_CONSTRUCTION = 64
+# TheoDB's build defaults, kept for documentation only — never for a decision.
+#
+# They are what an index gets when no `WITH` clause is emitted, and they coincide with
+# pgvector's own defaults, which is what makes the no-options comparison between the two
+# engines like-for-like without any adjustment. They are deliberately NOT used to accept
+# or refuse a requested value: that is the server's job (see the module docstring).
+THEODB_HNSW_DEFAULT_M = 16
+THEODB_HNSW_DEFAULT_EF_CONSTRUCTION = 64
 
-# Tracking item for making these real reloptions.
+# The build knobs this client will forward. Membership here means "emit it in WITH and
+# let the server rule on it", not "the engine supports it".
+FORWARDED_BUILD_PARAMS = ("m", "ef_construction")
+
+# Item that made these real reloptions.
 _BUILD_PARAM_ISSUE = "B-036"
 
 # Tracking item for exposing BM25's k1/b. TheoDB has no GUC for either — measured against
@@ -172,9 +183,9 @@ class TheoDBIndexConfig(BaseModel, DBCaseConfig):
 class TheoDBHNSWConfig(TheoDBIndexConfig):
     """HNSW over `theodb_hnsw`, addressed through its pgvector-compatible `hnsw` alias.
 
-    `m` and `ef_construction` are accepted only at the values TheoDB actually builds
-    with; anything else raises rather than being dropped. `ef_search` is a session GUC
-    and is fully honoured.
+    `m` and `ef_construction` are forwarded verbatim into the `WITH` clause; whether the
+    server honours them is decided by `TheoDB.probe_build_params`, before the load.
+    `ef_search` is a session GUC and is applied per connection.
     """
 
     index: IndexType = IndexType.HNSW
@@ -182,53 +193,23 @@ class TheoDBHNSWConfig(TheoDBIndexConfig):
     ef_construction: int | None = None
     ef_search: int | None = None
 
-    # Requested value -> what the engine will actually do. Only these are negotiable.
-    _honoured_build_params: ClassVar[dict[str, int]] = {
-        "m": THEODB_HNSW_M,
-        "ef_construction": THEODB_HNSW_EF_CONSTRUCTION,
-    }
+    def requested_build_params(self) -> dict[str, int]:
+        """The build knobs this case asked for, in the order the probe will emit them.
 
-    def __init__(self, **data: object) -> None:
-        # Checked before pydantic builds the model, so the caller gets
-        # UnsupportedBuildParameterError itself. Pydantic wraps anything raised inside a
-        # validator (including model_post_init) into a ValidationError, which keeps the
-        # message but loses the type — measured, not assumed.
-        self._refuse_unhonourable_build_params(data)
-        super().__init__(**data)
-
-    @classmethod
-    def _refuse_unhonourable_build_params(cls, values: object) -> None:
-        if not isinstance(values, dict):
-            return
-        for name, honoured in cls._honoured_build_params.items():
-            requested = values.get(name)
-            if requested is not None and requested != honoured:
-                raise UnsupportedBuildParameterError(
-                    name,
-                    requested,
-                    reason=(f"the build is fixed at {name}={honoured} (theodb_rs/src/am/build.rs:22-23)"),
-                    remedy=f"Use {name}={honoured} or omit it.",
-                    issue=_BUILD_PARAM_ISSUE,
-                )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _refuse_on_every_construction_path(cls, values: object) -> object:
-        # Backstop for paths that skip __init__ (model_validate, model_copy(update=...)).
-        # Here the error IS wrapped in a ValidationError; the message still reaches the
-        # user, which is what stops a run from measuring a parameter it never applied.
-        cls._refuse_unhonourable_build_params(values)
-        return values
+        Empty when nothing was asked — which is what lets the probe be skipped entirely
+        rather than paying a transaction to answer a question nobody posed.
+        """
+        return {
+            name: value
+            for name in FORWARDED_BUILD_PARAMS
+            if (value := getattr(self, name, None)) is not None
+        }
 
     def index_param(self) -> dict:
-        # `options` is always empty: the values that survive validation are exactly what
-        # the engine already does, and TheoDB's `hnsw` AM rejects `m` / `ef_construction`
-        # as reloptions outright ("unrecognized parameter"). Emitting a WITH clause would
-        # fail the CREATE INDEX.
         return {
             "metric": self.parse_metric(),
             "index_type": self.index.value.lower(),
-            "options": {},
+            "options": self.requested_build_params(),
         }
 
     def search_param(self) -> dict:

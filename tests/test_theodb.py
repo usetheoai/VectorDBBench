@@ -94,46 +94,44 @@ def test_theodb_cli_command_is_exposed():
 # --------------------------------------------------------------------------------------
 
 
-def test_unsupported_m_is_refused_at_config_time():
-    from vectordb_bench.backend.clients.theodb.config import (
-        TheoDBHNSWConfig,
-        UnsupportedBuildParameterError,
-    )
+def test_build_params_are_carried_by_the_config_not_refused_by_a_constant():
+    """B-046: `m`/`ef_construction` sao reloptions honradas desde o B-036 (cecd388).
 
-    with pytest.raises(UnsupportedBuildParameterError) as exc:
-        TheoDBHNSWConfig(metric_type=MetricType.L2, m=32)
-
-    message = str(exc.value)
-    assert all(token in message for token in ("m", "32", "16", "B-036")), message
-
-
-def test_unsupported_ef_construction_is_refused_at_config_time():
-    from vectordb_bench.backend.clients.theodb.config import (
-        TheoDBHNSWConfig,
-        UnsupportedBuildParameterError,
-    )
-
-    with pytest.raises(UnsupportedBuildParameterError) as exc:
-        TheoDBHNSWConfig(metric_type=MetricType.L2, ef_construction=200)
-
-    assert "ef_construction" in str(exc.value)
-
-
-def test_honored_values_are_accepted_and_never_forwarded():
+    O guard do B-035 comparava contra a constante THEODB_HNSW_M = 16 e recusava tudo o
+    mais. A constante deixou de descrever o motor, e um cliente que decide por ela mede o
+    ROTULO em vez da CAPACIDADE — a classe de erro que o b047 documentou. A decisao passa
+    para uma sonda contra o servidor.
+    """
     from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
 
-    config = TheoDBHNSWConfig(metric_type=MetricType.L2, m=16, ef_construction=64)
-    assert config.index_param()["options"] == {}
+    config = TheoDBHNSWConfig(metric_type=MetricType.L2, m=32, ef_construction=200)
+    assert config.index_param()["options"] == {"m": 32, "ef_construction": 200}
 
 
-def test_unset_build_params_are_accepted():
+def test_unset_build_params_emit_no_options():
+    """Sem pedido explicito, nada e emitido — o indice nasce com o default do motor."""
     from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
 
     assert TheoDBHNSWConfig(metric_type=MetricType.L2).index_param()["options"] == {}
 
 
-def test_create_index_statement_carries_no_with_clause():
-    """TheoDB's hnsw AM rejects `m` and `ef_construction`; the SQL must not emit WITH."""
+def test_create_index_statement_carries_the_with_clause():
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+    from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
+
+    statement = TheoDB.render_create_index(
+        table_name="t",
+        index_name="t_idx",
+        vector_field="embedding",
+        case_config=TheoDBHNSWConfig(metric_type=MetricType.L2, m=32, ef_construction=200),
+    )
+    assert "WITH (m = 32, ef_construction = 200)" in statement
+    assert "USING hnsw" in statement
+    assert "vector_l2_ops" in statement
+
+
+def test_create_index_statement_omits_the_with_clause_when_nothing_was_asked():
+    """Emitir WITH () vazio e erro de sintaxe; omitir e o comportamento correto."""
     from vectordb_bench.backend.clients.theodb.theodb import TheoDB
     from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
 
@@ -143,9 +141,130 @@ def test_create_index_statement_carries_no_with_clause():
         vector_field="embedding",
         case_config=TheoDBHNSWConfig(metric_type=MetricType.L2),
     )
-    assert "WITH (" not in statement
-    assert "USING hnsw" in statement
-    assert "vector_l2_ops" in statement
+    assert "WITH" not in statement
+
+
+def test_the_probe_sql_asks_for_exactly_what_was_requested():
+    """A sonda tem de testar as opcoes PEDIDAS, nao um par fixo.
+
+    Uma sonda que sempre testasse m=16 passaria contra qualquer servidor e liberaria
+    m=32 num motor que nao o suporta — precisamente o defeito que o guard existe para
+    impedir, com um passo a mais de indirecao.
+    """
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+    from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
+
+    sql = TheoDB.render_build_param_probe(
+        TheoDBHNSWConfig(metric_type=MetricType.L2, m=32, ef_construction=200)
+    )
+    assert "m = 32" in sql
+    assert "ef_construction = 200" in sql
+    assert "USING hnsw" in sql
+
+
+def test_probe_translates_a_server_refusal_into_the_typed_error():
+    """Sem banco: o tradutor de erro e puro e testavel isoladamente."""
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+    from vectordb_bench.backend.clients.theodb.config import (
+        TheoDBHNSWConfig,
+        UnsupportedBuildParameterError,
+    )
+
+    class _RefusingCursor:
+        def execute(self, sql, *a, **k):
+            raise RuntimeError('unrecognized parameter "m"')
+
+    with pytest.raises(UnsupportedBuildParameterError) as exc:
+        TheoDB.probe_build_params(
+            _RefusingCursor(), TheoDBHNSWConfig(metric_type=MetricType.L2, m=32)
+        )
+    message = str(exc.value)
+    assert "unrecognized parameter" in message, message
+    # A mensagem cita o que o SERVIDOR disse, nao a constante do cliente. Sem esta
+    # assercao o teste passaria com o guard antigo, que e a regressao a impedir.
+    assert "build.rs:22-23" not in message, message
+
+
+def test_probe_is_skipped_when_no_build_param_was_requested():
+    """Sem m/ef_construction pedidos nao ha o que sondar — e sondar custaria uma
+    transacao por corrida sem responder pergunta nenhuma."""
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+    from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
+
+    class _ExplodingCursor:
+        def execute(self, *a, **k):
+            raise AssertionError("a sonda nao devia ter rodado")
+
+    TheoDB.probe_build_params(_ExplodingCursor(), TheoDBHNSWConfig(metric_type=MetricType.L2))
+
+
+def test_probe_rolls_back_and_leaves_nothing_behind():
+    """A sonda cria uma tabela temporaria e um indice. Se algum deles sobreviver, a
+    proxima corrida herda estado — e uma corrida que herda estado nao e reproduzivel."""
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+    from vectordb_bench.backend.clients.theodb.config import TheoDBHNSWConfig
+
+    executed: list[str] = []
+
+    class _RecordingCursor:
+        def execute(self, sql, *a, **k):
+            executed.append(str(sql))
+
+    TheoDB.probe_build_params(
+        _RecordingCursor(), TheoDBHNSWConfig(metric_type=MetricType.L2, m=32)
+    )
+    joined = " ".join(executed).upper()
+    assert "SAVEPOINT" in joined, executed
+    assert "ROLLBACK TO" in joined, executed
+
+
+@needs_theodb
+def test_build_params_reach_the_catalog_against_a_real_server(corpus):
+    """T1.2 — a prova e o CATALOGO, nao o SQL emitido.
+
+    Um servidor que aceitasse a clausula e a ignorasse devolveria reloptions NULL aqui, e
+    e exatamente esse caso que separa "aceito" de "honrado" — a distincao que o B-034
+    pagou para aprender.
+    """
+    import psycopg
+    from pydantic import SecretStr
+    from vectordb_bench.backend.clients.theodb.config import TheoDBConfig, TheoDBHNSWConfig
+    from vectordb_bench.backend.clients.theodb.theodb import TheoDB
+
+    client = TheoDB(
+        dim=DIM,
+        db_config=TheoDBConfig(
+            user_name=SecretStr(THEODB_USER), password=SecretStr(THEODB_PASSWORD),
+            host=THEODB_HOST, port=THEODB_PORT, db_name=THEODB_DBNAME,
+        ).to_dict(),
+        db_case_config=TheoDBHNSWConfig(metric_type=MetricType.L2, m=32, ef_construction=200),
+        collection_name="vdbb_b046_params",
+        drop_old=True,
+    )
+    with client.init():
+        client.insert_embeddings(corpus[0][:500], list(range(500)))
+        client.optimize()
+
+    with psycopg.connect(
+        host=THEODB_HOST, port=THEODB_PORT, user=THEODB_USER,
+        password=THEODB_PASSWORD, dbname=THEODB_DBNAME,
+    ) as conn:
+        # O JOIN em pg_am nao e enfeite: sem ele a consulta tambem casa o indice de
+        # chave primaria (`..._pkey`, btree), cujas reloptions sao legitimamente NULL —
+        # e a primeira versao deste teste reprovou por ler essa linha, acusando o codigo
+        # de um defeito que era da assercao. Filtrar pelo access method faz o teste
+        # afirmar tambem que o indice esta no `hnsw`, que e parte do que se quer provar.
+        rows = conn.execute(
+            "SELECT c.relname, c.reloptions FROM pg_class c "
+            "JOIN pg_am am ON am.oid = c.relam "
+            "WHERE c.relname LIKE %s AND c.relkind = 'i' AND am.amname = 'hnsw'",
+            ("%b046_params%",),
+        ).fetchall()
+
+    assert len(rows) == 1, f"esperado exatamente 1 indice hnsw, veio {rows}"
+    _, options = rows[0]
+    assert options is not None, "o indice nasceu sem reloptions: a clausula WITH nao chegou"
+    assert sorted(options) == ["ef_construction=200", "m=32"], options
 
 
 # --------------------------------------------------------------------------------------
