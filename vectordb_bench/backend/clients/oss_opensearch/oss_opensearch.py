@@ -18,7 +18,12 @@ log = logging.getLogger(__name__)
 
 WAITING_FOR_REFRESH_SEC: Final[int] = 30
 WAITING_FOR_FORCE_MERGE_SEC: Final[int] = 30
-REPLICA_HEALTH_TIMEOUT: Final[str] = "30m"
+# The transport takes a numeric timeout in SECONDS, not Elasticsearch duration syntax. Passing "30m"
+# raises `ValueError(Timeout value connect was 30m, but it must be an int, float or None)` before any
+# request leaves the process, and `_update_replicas` calls `_wait_till_green` unconditionally from
+# `optimize()` — so every OpenSearch run fails at the optimize step rather than merely running slowly.
+# Measured on opensearch-py against OpenSearch 2.17.1.
+REPLICA_HEALTH_TIMEOUT: Final[int] = 1800
 
 # Central registry for version-dependent OpenSearch index settings.
 # Add new rules here to automatically support future versions.
